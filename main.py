@@ -1,22 +1,39 @@
 import os
 import asyncio
+import logging
 import calendar
+from pytz import timezone
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
 from aiogram import Bot, types
-from aiogram.dispatcher import Dispatcher
 from aiogram.types import InputFile
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.dispatcher.filters import Command
-from aiogram.dispatcher.filters.builtin import CommandHelp
-from aiogram.types.inline_keyboard import InlineKeyboardButton
+from geopy.geocoders import Nominatim
+from aiogram.dispatcher import Dispatcher
+from timezonefinder import TimezoneFinder
 from aiogram.utils.callback_data import CallbackData
+from aiogram.dispatcher.filters.builtin import CommandHelp
+from aiogram.contrib.fsm_storage.redis import RedisStorage2
+from aiogram.types.inline_keyboard import InlineKeyboardButton
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
 
-API_TOKEN = ""
+from middleware import TimezoneMiddleware
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+logger = logging.getLogger(__name__)
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Get values from the .env file
+REDIS_HOST = os.getenv('REDIS_HOST')
+REDIS_PORT = int(os.getenv('REDIS_PORT'))
+API_TOKEN = os.getenv('API_TOKEN')
+
+bot = Bot(API_TOKEN)
+storage = RedisStorage2(REDIS_HOST, REDIS_PORT)
+dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
+dp.middleware.setup(TimezoneMiddleware(bot, storage))
 
 # Initialize callback_data factories
 hour_cb = CallbackData("hour", "hour", "year", "month", "day")
@@ -24,32 +41,102 @@ date_cb = CallbackData("date", "action", "year", "month", "day")
 time_cb = CallbackData("time", "hour", "minute", "year", "month", "day")
 minute_cb = CallbackData("minute", "minute", "hour", "year", "month", "day")
 
-# Create a dictionary to store reminders
-reminders = {}
+
+async def add_reminder(user_id: int, reminder_time: datetime, voice_file_id: str):
+    reminder_data = await dp.storage.get_data(chat=user_id, user=user_id)
+    reminders = reminder_data.get("reminders", [])
+
+    reminders.append({
+        "reminder_time": reminder_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "voice_file_id": voice_file_id
+    })
+
+    reminder_data["reminders"] = reminders
+    await dp.storage.update_data(chat=user_id, user=user_id, data=reminder_data)
 
 
-async def show_reminders(user_id: int) -> str:
-    if user_id not in reminders:
-        return "You have no reminders."
+async def remove_reminder(user_id, voice_file_id):
+    reminder_data = await dp.storage.get_data(user=user_id, chat=user_id)
 
-    reminders_text = ""
-    for idx, reminder in enumerate(reminders[user_id]):
-        date_str = reminder[0].strftime('%Y-%m-%d %H:%M')
-        reminders_text += f"{idx + 1}. {date_str}\n"
+    for reminder in reminder_data['reminders']:
+        if reminder['voice_file_id'] == voice_file_id:
+            reminder_data['reminders'].remove(reminder)
+            logger.info(f"Reminder with voice_file_id '{voice_file_id}' was deleted.")
+            break
+    else:
+        logger.info(f"No reminder with voice_file_id '{voice_file_id}' was found.")
 
-    return reminders_text if reminders_text else "You have no reminders."
+    await dp.storage.update_data(chat=user_id, user=user_id, data=reminder_data)
+
+
+async def schedule_reminder(user_id, user_tz, selected_time, voice_file_id):
+    # Calculate the time delta between now and the scheduled reminder
+    local_now = datetime.now(user_tz)
+    reminder_delta = (selected_time - local_now).total_seconds()
+
+    # Sleep for the calculated time delta
+    await asyncio.sleep(reminder_delta)
+
+    # Send the voice message at the scheduled time
+    voice_file = await bot.download_file_by_id(voice_file_id)
+    with open("temp_voice.ogg", "wb") as f:
+        f.write(voice_file.getvalue())
+
+    with open("temp_voice.ogg", "rb") as f:
+        await bot.send_voice(chat_id=user_id, voice=InputFile(f))
+
+    try:
+        os.remove("temp_voice.ogg")
+    except FileNotFoundError:
+        pass
+
+    # Remove the reminder from the list
+    await remove_reminder(user_id, voice_file_id)
 
 
 @dp.message_handler(commands=["reminders"])
 async def reminders_handler(message: types.Message):
-    user_id = message.from_user.id
-    reminders_text = await show_reminders(user_id)
-    await message.reply(reminders_text)
+    user = message.from_user
+    user_data = await dp.storage.get_data(chat=message.chat.id, user=user.id)
+    user_reminders = user_data.get("reminders", [])
+
+    if not user_reminders:
+        await message.reply("No reminders found for you.")
+
+    reminders_string = ""
+    for reminder in user_reminders:
+        selected_time = datetime.strptime(reminder["reminder_time"], "%Y-%m-%d %H:%M:%S")
+        reminders_string += f"{selected_time.strftime('%Y-%m-%d %H:%M')}\n"
+
+    if reminders_string:
+        await message.reply(reminders_string)
+    else:
+        await message.reply("No reminders found for you.")
 
 
-@dp.message_handler(Command("start"))
+@dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    await message.reply("Welcome to VoiceReminderBot! Send me a voice message and I'll help you set a reminder.")
+    # Ask for the user's city
+    await message.reply("Welcome to VoiceReminderBot!\n"
+                        "Please set your timezone using /timezone <City, Country> command.")
+
+
+@dp.message_handler(commands=["timezone"])
+async def timezone_handler(message: types.Message):
+    # Use geopy to get the timezone for the city
+    tf = TimezoneFinder()
+    city = message.text.split(" ", 1)[1]
+    geolocator = Nominatim(user_agent="VoiceReminderBot")
+    coords = geolocator.geocode(city)
+    timezone_name = tf.timezone_at(lng=coords.longitude, lat=coords.latitude)
+    if timezone:
+        timezone_name = timezone(timezone_name).zone
+        timezone_data = {"timezone": timezone_name}
+        # Save timezone in Redis cache
+        await dp.storage.set_data(chat=message.chat.id, user=message.from_user.id, data=timezone_data)
+        await message.reply(f"Your timezone is {timezone_name}. Send me a voice message to set a reminder.")
+    else:
+        await message.reply("Sorry, I couldn't find that city. Please try again.")
 
 
 @dp.message_handler(content_types=types.ContentType.VOICE)
@@ -73,7 +160,15 @@ async def process_month_callback(callback_query: types.CallbackQuery, callback_d
     year, month = int(callback_data["year"]), int(callback_data["month"])
     _, last_day = calendar.monthrange(year, month)
 
-    today = datetime.now().date()
+    # Get the user's timezone
+    user_timezone = await dp.storage.get_data(
+        chat=callback_query.message.chat.id, user=callback_query.from_user.id)
+    user_tz = timezone(user_timezone["timezone"])
+
+    # Convert the current time to the user's timezone
+    local_now = datetime.now(user_tz)
+
+    today = local_now.date()
     is_current_month = (year, month) == (today.year, today.month)
 
     markup = types.InlineKeyboardMarkup(row_width=7)
@@ -135,41 +230,30 @@ async def process_hour_callback(callback_query: types.CallbackQuery, callback_da
 async def process_minute_callback(callback_query: types.CallbackQuery, callback_data: dict):
     hour, minute, year, month, day = int(callback_data["hour"]), int(callback_data["minute"]), int(
         callback_data["year"]), int(callback_data["month"]), int(callback_data["day"])
-    selected_time = datetime(year, month, day, hour, minute, second=0, microsecond=0)
+
+    # Get the user's timezone
+    user_timezone = await dp.storage.get_data(
+        chat=callback_query.message.chat.id, user=callback_query.from_user.id)
+    user_tz = timezone(user_timezone["timezone"])
+
+    selected_time_naive = datetime(year, month, day, hour, minute, second=0, microsecond=0)
+    selected_time = user_tz.localize(selected_time_naive)
 
     user_id = callback_query.from_user.id
     voice_file_id = callback_query.message.reply_to_message.voice.file_id
 
-    # Store the reminder in the reminders dictionary
-    if user_id not in reminders:
-        reminders[user_id] = []
-
-    reminders[user_id].append((selected_time, voice_file_id))
+    # Add the reminder to the reminders storage
+    await add_reminder(user_id, selected_time, voice_file_id)
 
     # Send confirmation message
     await callback_query.answer()
     await callback_query.message.edit_text(
-        f"Reminder set for {selected_time.strftime('%Y-%m-%d %H:%M')}. You'll receive your voice message at the specified time."
+        f"Reminder set for {selected_time.strftime('%Y-%m-%d %H:%M')}.\n"
+        f"You'll receive your voice message at the specified time."
     )
 
     # Schedule sending the voice message
-    reminder_delta = (selected_time - datetime.now()).total_seconds()
-    await asyncio.sleep(reminder_delta)
-
-    voice_file = await bot.download_file_by_id(voice_file_id)
-    with open("temp_voice.ogg", "wb") as f:
-        f.write(voice_file.getvalue())
-
-    with open("temp_voice.ogg", "rb") as f:
-        await bot.send_voice(chat_id=user_id, voice=InputFile(f))
-
-    try:
-        os.remove("temp_voice.ogg")
-    except FileNotFoundError:
-        pass
-
-    # Remove the reminder from the list
-    reminders[user_id].remove((selected_time, voice_file_id))
+    await schedule_reminder(user_id, user_tz, selected_time, voice_file_id)
 
 
 @dp.message_handler(CommandHelp())
@@ -182,7 +266,21 @@ async def cmd_help(message: types.Message):
     await message.reply(text)
 
 
-if __name__ == "__main__":
-    from aiogram import executor
+async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+    logger.info('Starting VoiceReminderBot')
+    try:
+        await dp.start_polling()
+    finally:
+        logger.info('Stopping VoiceReminderBot')
+        await dp.storage.close()
+        await dp.storage.wait_closed()
+        session = await dp.bot.get_session()
+        await session.close()
 
-    executor.start_polling(dp, skip_updates=True)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.error("Exit")
